@@ -1,0 +1,5 @@
+import AlertsClient from "@/ui/components/AlertsClient";
+
+export default function Page() {
+  return <AlertsClient />;
+}

@@ -1,0 +1,420 @@
+"use client";
+
+/* eslint-disable react-hooks/set-state-in-effect */
+
+import { useEffect, useMemo, useState } from "react";
+import { DateTime } from "luxon";
+
+import TopNav from "@/ui/components/TopNav";
+import { BrowserLocalStorage, LocalStoragePrefsRepo } from "@/infrastructure/storage";
+import { loadPrefs, savePrefs } from "@/application/useCases/prefs";
+import { DEFAULT_PREFS } from "@/domain/prefs";
+import { parseUserPrefs } from "@/domain/validation/prefs";
+
+const ALERT_KIND_VALUES = ["session_start", "session_end", "overlap_start", "overlap_end"] as const;
+type AlertKindValue = (typeof ALERT_KIND_VALUES)[number];
+
+const KIND_OPTIONS: Array<{ id: AlertKindValue; label: string }> = [
+  { id: "session_start", label: "Session start" },
+  { id: "session_end", label: "Session end" },
+  { id: "overlap_start", label: "Overlap start" },
+  { id: "overlap_end", label: "Overlap end" },
+];
+
+function clampInt(n: number, min: number, max: number): number {
+  const x = Number.isFinite(n) ? Math.trunc(n) : min;
+  return Math.max(min, Math.min(max, x));
+}
+
+function safeHHmm(v: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+}
+
+function isValidIanaZone(z: string): boolean {
+  if (!z || typeof z !== "string") return false;
+  try {
+    return DateTime.now().setZone(z).isValid;
+  } catch {
+    return false;
+  }
+}
+
+function getTimeZoneSuggestions(limit: number): string[] {
+  return [
+    "Africa/Nairobi",
+    "UTC",
+    "Europe/London",
+    "Europe/Berlin",
+    "America/New_York",
+    "America/Chicago",
+    "America/Los_Angeles",
+    "Asia/Tokyo",
+    "Asia/Shanghai",
+    "Asia/Singapore",
+    "Australia/Sydney",
+    "Pacific/Auckland",
+    "Asia/Dubai",
+    "Asia/Kolkata",
+  ].slice(0, limit);
+}
+
+export default function AlertsClient() {
+  // Create repo (SSR-safe)
+  const repo = useMemo<LocalStoragePrefsRepo | null>(() => {
+    if (typeof window === "undefined") return null;
+    const storage = new BrowserLocalStorage(window.localStorage);
+    return new LocalStoragePrefsRepo(storage);
+  }, []);
+
+  const suggestions = useMemo(() => getTimeZoneSuggestions(30), []);
+
+  const [prefs, setPrefs] = useState(DEFAULT_PREFS);
+  const [ready, setReady] = useState(false);
+
+  // UI state (editable)
+  const [enabled, setEnabled] = useState(false);
+  const [displayZone, setDisplayZone] = useState<string>("Africa/Nairobi");
+  const [horizonDays, setHorizonDays] = useState<number>(7);
+  const [leadMinutes, setLeadMinutes] = useState<number>(10);
+  const [weekendsOff, setWeekendsOff] = useState<boolean>(true);
+  const [quietEnabled, setQuietEnabled] = useState<boolean>(false);
+  const [quietStart, setQuietStart] = useState<string>("22:00");
+  const [quietEnd, setQuietEnd] = useState<string>("06:00");
+  const [kindsEnabled, setKindsEnabled] = useState<AlertKindValue[]>(["session_start", "overlap_start"]);
+
+  const [perm, setPerm] = useState<NotificationPermission>(() => {
+    if (typeof window === "undefined") return "denied";
+    if (!("Notification" in window)) return "denied";
+    return Notification.permission;
+  });
+
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [statusMsg, setStatusMsg] = useState<string>("");
+
+  useEffect(() => {
+    if (!repo) return;
+
+    let mounted = true;
+    (async () => {
+      const p = await loadPrefs(repo).catch(() => DEFAULT_PREFS);
+      if (!mounted) return;
+
+      setPrefs(p);
+      setReady(true);
+
+      const a = (p.alerts ?? DEFAULT_PREFS.alerts);
+
+      setEnabled(Boolean(a.enabled));
+      setDisplayZone(String(a.displayZone ?? p.displayZone ?? "Africa/Nairobi"));
+      setHorizonDays(Number(a.horizonDays ?? 7));
+      setLeadMinutes(Number(a.leadMinutes ?? 10));
+      setWeekendsOff(Boolean(a.weekendsOff ?? true));
+
+      const q = a.quietHours ?? { enabled: false, startHHmm: "22:00", endHHmm: "06:00" };
+      setQuietEnabled(Boolean(q.enabled));
+      setQuietStart(String(q.startHHmm ?? "22:00"));
+      setQuietEnd(String(q.endHHmm ?? "06:00"));
+
+      const kindsRaw = Array.isArray(a.kindsEnabled) ? a.kindsEnabled : [];
+      const filtered = kindsRaw.filter((x): x is AlertKindValue =>
+        (ALERT_KIND_VALUES as readonly string[]).includes(String(x))
+      );
+      setKindsEnabled(filtered.length ? filtered : ["session_start"]);
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [repo]);
+
+  const effectiveZone = isValidIanaZone(displayZone) ? displayZone : "Africa/Nairobi";
+  const nowStr = DateTime.now().setZone(effectiveZone).toFormat("HH:mm:ss");
+
+  function toggleKind(id: AlertKindValue) {
+    setKindsEnabled((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+
+      if (next.size === 0) next.add("session_start");
+      return Array.from(next);
+    });
+  }
+
+  async function requestPerm() {
+    if (typeof window === "undefined") return;
+    if (!("Notification" in window)) {
+      setPerm("denied");
+      setStatus("error");
+      setStatusMsg("Notifications not supported in this browser.");
+      return;
+    }
+    const p = await Notification.requestPermission();
+    setPerm(p);
+    setStatus("idle");
+    setStatusMsg("");
+  }
+
+  function testNotify() {
+    if (typeof window === "undefined") return;
+    if (!("Notification" in window)) return;
+    if (Notification.permission !== "granted") {
+      setStatus("error");
+      setStatusMsg("Permission not granted. Click Enable first.");
+      return;
+    }
+
+    new Notification("SessionSync", {
+      body: `Test alert at ${DateTime.now().setZone(effectiveZone).toFormat("HH:mm:ss")} (${effectiveZone})`,
+      silent: false,
+    });
+
+    setStatus("saved");
+    setStatusMsg("Test notification sent.");
+    window.setTimeout(() => {
+      setStatus("idle");
+      setStatusMsg("");
+    }, 1200);
+  }
+
+  async function save() {
+    if (!repo) return;
+
+    setStatus("saving");
+    setStatusMsg("Saving...");
+
+    const zone = isValidIanaZone(displayZone) ? displayZone : (prefs.displayZone ?? "Africa/Nairobi");
+
+    const draft = {
+      ...prefs,
+      alerts: {
+        ...(prefs.alerts ?? DEFAULT_PREFS.alerts),
+        enabled: Boolean(enabled),
+        displayZone: zone,
+        horizonDays: clampInt(Number(horizonDays) || 7, 1, 60),
+        leadMinutes: clampInt(Number(leadMinutes) || 10, 0, 240),
+        weekendsOff: Boolean(weekendsOff),
+        kindsEnabled: kindsEnabled,
+        quietHours: {
+          enabled: Boolean(quietEnabled),
+          startHHmm: safeHHmm(quietStart) ? quietStart : "22:00",
+          endHHmm: safeHHmm(quietEnd) ? quietEnd : "06:00",
+        },
+      },
+    };
+
+    try {
+      // Convert draft -> UserPrefs using the canonical schema (avoids type mismatches)
+      const nextPrefs = parseUserPrefs(draft);
+      await savePrefs(repo, nextPrefs);
+      setPrefs(nextPrefs);
+      setStatus("saved");
+      setStatusMsg("Saved.");
+      window.setTimeout(() => {
+        setStatus("idle");
+        setStatusMsg("");
+      }, 1200);
+    } catch (e) {
+      setStatus("error");
+      setStatusMsg("Could not save. Check console.");
+      // eslint-disable-next-line no-console
+      console.error(e);
+    }
+  }
+
+  if (!repo || !ready) {
+    return (
+      <div className="p-6 space-y-4">
+        <TopNav />
+        <div className="text-sm opacity-70">Loading…</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 space-y-6 max-w-3xl">
+      <TopNav />
+
+      <header className="space-y-1">
+        <h1 className="text-2xl font-semibold">Notifications & Alerts</h1>
+        <div className="text-sm opacity-70">
+          Preview time: <span className="font-mono">{nowStr}</span>{" "}
+          <span className="opacity-70">({effectiveZone})</span>
+        </div>
+      </header>
+
+      <section className="rounded-2xl border p-5 space-y-3">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <div className="text-sm opacity-70">Browser notifications</div>
+            <div className="font-medium">
+              {typeof window === "undefined" || !("Notification" in window) ? "Not supported" : perm}
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            <button
+              type="button"
+              className="px-3 py-2 rounded-xl border hover:bg-black/5 dark:hover:bg-white/5"
+              onClick={requestPerm}
+              disabled={typeof window === "undefined" || !("Notification" in window) || perm === "granted"}
+            >
+              Enable
+            </button>
+            <button
+              type="button"
+              className="px-3 py-2 rounded-xl border hover:bg-black/5 dark:hover:bg-white/5"
+              onClick={testNotify}
+              disabled={typeof window === "undefined" || !("Notification" in window) || perm !== "granted"}
+            >
+              Test
+            </button>
+          </div>
+        </div>
+
+        <div className="text-xs opacity-70">
+          In v1, alerts trigger while SessionSync is open in your browser.
+        </div>
+      </section>
+
+      <section className="rounded-2xl border p-5 space-y-4">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <div className="font-semibold">Enable alerts</div>
+            <div className="text-sm opacity-70">Turn on/off all alert scheduling.</div>
+          </div>
+          <label className="inline-flex items-center gap-2">
+            <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+            <span className="text-sm">Enabled</span>
+          </label>
+        </div>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Alerts display zone (IANA)</label>
+            <input
+              className="w-full rounded-xl border px-3 py-2 text-sm font-mono"
+              value={displayZone}
+              onChange={(e) => setDisplayZone(e.target.value)}
+              list="tz-suggestions"
+              placeholder="e.g. UTC, Africa/Nairobi, Europe/London"
+              spellCheck={false}
+            />
+            <datalist id="tz-suggestions">
+              {suggestions.map((z) => (
+                <option value={z} key={z} />
+              ))}
+            </datalist>
+            <div className="text-xs opacity-70">
+              {isValidIanaZone(displayZone) ? "Valid timezone." : "Invalid timezone (will fallback on save)."}
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Horizon (days)</label>
+            <input
+              className="w-full rounded-xl border px-3 py-2 text-sm"
+              type="number"
+              min={1}
+              max={60}
+              value={horizonDays}
+              onChange={(e) => setHorizonDays(Number(e.target.value))}
+            />
+            <div className="text-xs opacity-70">How far ahead alerts are generated (1–60).</div>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Lead minutes</label>
+            <input
+              className="w-full rounded-xl border px-3 py-2 text-sm"
+              type="number"
+              min={0}
+              max={240}
+              value={leadMinutes}
+              onChange={(e) => setLeadMinutes(Number(e.target.value))}
+            />
+            <div className="text-xs opacity-70">Notify this many minutes before the event (0–240).</div>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Weekends off</label>
+            <label className="inline-flex items-center gap-2 pt-2">
+              <input type="checkbox" checked={weekendsOff} onChange={(e) => setWeekendsOff(e.target.checked)} />
+              <span className="text-sm">Disable alerts on Sat/Sun</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="rounded-xl border p-4 space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="font-semibold">Quiet hours</div>
+              <div className="text-sm opacity-70">Suppress alerts during a time window (in alert zone).</div>
+            </div>
+            <label className="inline-flex items-center gap-2">
+              <input type="checkbox" checked={quietEnabled} onChange={(e) => setQuietEnabled(e.target.checked)} />
+              <span className="text-sm">Enabled</span>
+            </label>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1">
+              <label className="text-sm font-medium">Start (HH:mm)</label>
+              <input
+                className="w-full rounded-xl border px-3 py-2 text-sm font-mono"
+                value={quietStart}
+                onChange={(e) => setQuietStart(e.target.value)}
+                placeholder="22:00"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">End (HH:mm)</label>
+              <input
+                className="w-full rounded-xl border px-3 py-2 text-sm font-mono"
+                value={quietEnd}
+                onChange={(e) => setQuietEnd(e.target.value)}
+                placeholder="06:00"
+              />
+            </div>
+          </div>
+
+          <div className="text-xs opacity-70">
+            {safeHHmm(quietStart) && safeHHmm(quietEnd) ? "Format OK." : "Use HH:mm (e.g. 22:00)."}
+          </div>
+        </div>
+
+        <div className="rounded-xl border p-4 space-y-3">
+          <div className="font-semibold">Kinds enabled</div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {KIND_OPTIONS.map((k) => (
+              <label key={k.id} className="inline-flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={kindsEnabled.includes(k.id)}
+                  onChange={() => toggleKind(k.id)}
+                />
+                <span className="text-sm">{k.label}</span>
+              </label>
+            ))}
+          </div>
+          <div className="text-xs opacity-70">At least one kind stays enabled.</div>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <button
+            type="button"
+            className="px-4 py-2 rounded-xl border hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-60"
+            onClick={save}
+            disabled={status === "saving"}
+          >
+            {status === "saving" ? "Saving…" : "Save"}
+          </button>
+
+          <div className="text-sm">
+            {statusMsg ? <span className={status === "error" ? "text-red-600" : "opacity-70"}>{statusMsg}</span> : null}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
